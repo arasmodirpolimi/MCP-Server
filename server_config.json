@@ -12,7 +12,7 @@
         
         "research": {
             "command": "uv",
-            "args": ["run", "research_server.py"]
+            "args": ["run", "weather_server.py"]
         },
         
         "fetch": {
