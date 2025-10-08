@@ -10,30 +10,42 @@ load_dotenv()
 # ---------------------------
 # Ollama adapter (no OpenAI)
 # ---------------------------
+# --- in OllamaAdapter ---
 class OllamaAdapter:
     def __init__(self, base: str = "http://127.0.0.1:11434"):
         self.base = base.rstrip("/")
 
-    def chat_once(self, model: str, messages: List[Dict[str, str]], temperature: float = 0.1):
+    def chat_once(
+        self,
+        model: str,
+        messages,
+        temperature: float = 0.1,
+        tools=None,                # NEW
+        tool_choice: str | dict | None = "auto",  # "auto" | "none" | {"type":"function","function":{"name":"..."}}
+    ):
         payload = {
             "model": model,
             "messages": messages,
             "stream": False,
             "options": {"temperature": temperature},
         }
+        if tools:        payload["tools"] = tools
+        if tool_choice:  payload["tool_choice"] = tool_choice
         r = requests.post(f"{self.base}/api/chat", json=payload, timeout=120)
         r.raise_for_status()
         data = r.json()
-        # Return an OpenAI-ish shape for minimal changes downstream
+        # Preserve tool_calls if present
+        msg = data.get("message", {}) or {}
         return {
             "choices": [{
                 "message": {
-                    "role": data.get("message", {}).get("role", "assistant"),
-                    "content": data.get("message", {}).get("content", ""),
-                    "tool_calls": None,  # Ollama does not produce OpenAI-style tool_calls
+                    "role": msg.get("role", "assistant"),
+                    "content": msg.get("content", ""),
+                    "tool_calls": msg.get("tool_calls"),  # <-- keep it
                 }
             }]
         }
+
 
 
 def _flatten_tool_content(content_list) -> str:
@@ -161,7 +173,7 @@ class MCP_ChatBot:
             "```\n"
             f"{tool_output_text}\n"
             "```\n\n"
-            "Task: Summarize the current weather succinctly (1–3 sentences). "
+            "Task: Summarize the current weather succinctly (1-3 sentences). "
             "Include temperature with unit and the main condition. "
             "If the tool data lacks a value, omit it rather than guessing."
         )
@@ -311,38 +323,6 @@ class MCP_ChatBot:
                 )
                 print(refined or (content or "(no result)"))
                 return
-
-            elif "fetch" in self.tool_to_session:
-                city = urllib.parse.quote(w["location"])
-                url = f"https://wttr.in/{city}?format=j1"
-                print(f"No get_current_weather tool. Falling back to fetch: {url}")
-                raw = await self._call_mcp_tool("fetch", {"url": url, "raw": True, "max_length": 10000})
-
-                # Create a compact JSON we pass to the model
-                compact = None
-                try:
-                    data = json.loads(raw) if isinstance(raw, str) else raw
-                    cur = (data.get("current_condition") or [{}])[0]
-                    compact = {
-                        "location": w["location"],
-                        "unit": "celsius",
-                        "temperature": cur.get("temp_C"),
-                        "feels_like": cur.get("FeelsLikeC"),
-                        "desc": (cur.get("weatherDesc") or [{"value": ""}])[0].get("value", "")
-                    }
-                except Exception:
-                    pass
-
-                tool_text = json.dumps(compact, ensure_ascii=False) if compact else (raw or "")
-                refined = await self._refine_with_model(
-                    tool_name="fetch(wttr.in)",
-                    tool_args={"url": url},
-                    tool_output_text=tool_text,
-                    model=model,
-                )
-                print(refined or (tool_text or "(no result)"))
-                return
-
             else:
                 print("No weather-capable MCP tools connected (get_current_weather/fetch).")
                 return
