@@ -14,14 +14,16 @@ def _flatten_tool_content(content_list) -> str:
     parts = []
     if isinstance(content_list, list):
         for item in content_list:
-            # Most MCP content parts have a 'type' and either 'text' or 'data'
             t = getattr(item, "type", None) or (isinstance(item, dict) and item.get("type"))
             if t == "text":
                 txt = getattr(item, "text", None) or (isinstance(item, dict) and item.get("text"))
                 if txt is not None:
                     parts.append(str(txt))
             elif t in ("json", "object"):
-                data = getattr(item, "data", None) or (isinstance(item, dict) and (item.get("data") or item.get("value")))
+                data = (
+                    getattr(item, "data", None)
+                    or (isinstance(item, dict) and (item.get("data") or item.get("value")))
+                )
                 try:
                     parts.append(json.dumps(data, ensure_ascii=False))
                 except Exception:
@@ -38,6 +40,7 @@ def _flatten_tool_content(content_list) -> str:
             parts.append(str(content_list))
     return "\n".join(parts)
 
+
 class ToolDefinition(TypedDict):
     name: str
     description: str
@@ -46,7 +49,20 @@ class ToolDefinition(TypedDict):
 
 class MCP_ChatBot:
     def __init__(self):
-        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        # Point to local proxy by default (LiteLLM on :4000); falls back to OpenAI if you set OPENAI_BASE_URL accordingly
+        base_url = os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:4000/v1")
+        api_key = os.getenv("OPENAI_API_KEY", "sk-local")  # any non-empty string for local proxies
+        self.model_default = os.getenv("LOCAL_MODEL", "qwen2.5:1.5b")
+
+        self.client = OpenAI(base_url=base_url, api_key=api_key)
+        
+        def print_available_models(client):
+            try:
+                resp = client.models.list()
+                print("Models from base_url:", [m.id for m in resp.data])
+            except Exception as e:
+                print("Failed to list models:", e)
+
         self.exit_stack = AsyncExitStack()
         self.sessions: List[ClientSession] = []
         self.tool_to_session: Dict[str, ClientSession] = {}
@@ -97,7 +113,8 @@ class MCP_ChatBot:
         for name, server_cfg in servers.items():
             await self.connect_to_server(name, server_cfg)
 
-    async def process_query(self, query: str, model: str = "gpt-3.5-turbo"):
+    async def process_query(self, query: str, model: str | None = None):
+        model = model or self.model_default
         messages: List[Dict[str, Any]] = [{"role": "user", "content": query}]
 
         while True:
@@ -139,12 +156,17 @@ class MCP_ChatBot:
                         continue
 
                     print(f"Calling tool {tool_name} with args {args}")
-                    result = await session.call_tool(tool_name, arguments=args)
+                    try:
+                        result = await session.call_tool(tool_name, arguments=args)
+                        tool_content = _flatten_tool_content(result.content)
+                    except Exception as e:
+                        tool_content = f"Tool '{tool_name}' failed: {e}"
+
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
                         "name": tool_name,
-                        "content": _flatten_tool_content(result.content),
+                        "content": tool_content,
                     })
 
                 # Let the model read tool results and continue
@@ -156,13 +178,14 @@ class MCP_ChatBot:
             break
 
     async def chat_loop(self):
-        print("\nMCP Chatbot (OpenAI) — type your query, or 'quit' to exit.")
+        print("\nMCP Chatbot (OpenAI-compatible) — type your query, or 'quit' to exit.")
+        print(f"Using model: {self.model_default}")
         while True:
             try:
                 q = input("\nQuery: ").strip()
                 if q.lower() == "quit":
                     break
-                await self.process_query(q)
+                await self.process_query(q)  # uses self.model_default
             except Exception as e:
                 print(f"Error: {e}")
 
@@ -172,24 +195,22 @@ class MCP_ChatBot:
             await self.chat_loop()
         finally:
             await self.exit_stack.aclose()
-            
-    async def cleanup(self): # new
-        """Cleanly close all resources using AsyncExitStack."""
-        await self.exit_stack.aclose()
-
 
 
 async def main():
-    chatbot = MCP_ChatBot()
+    bot = MCP_ChatBot()
+    await bot.run()
+
+
+# Safe runner: works in normal terminals and in environments with an active event loop
+def _run_async(coro):
     try:
-        # the mcp clients and sessions are not initialized using "with"
-        # like in the previous lesson
-        # so the cleanup should be manually handled
-        await chatbot.connect_to_servers() # new! 
-        await chatbot.chat_loop()
-    finally:
-        await chatbot.cleanup() #new! 
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    else:
+        return asyncio.create_task(coro)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    _run_async(main())

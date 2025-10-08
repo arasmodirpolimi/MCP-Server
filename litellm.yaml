@@ -1,0 +1,8 @@
+model_list:
+  - model_name: deepseek-r1:1.5b
+    litellm_params:
+      model: ollama/deepseek-r1:1.5b
+
+  - model_name: qwen2.5:1.5b
+    litellm_params:
+      model: ollama/qwen2.5:1.5b
