@@ -1,16 +1,43 @@
 from dotenv import load_dotenv
-from openai import OpenAI
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
-from typing import List, Dict, TypedDict, Any
+from typing import List, Dict, TypedDict, Any, Optional
 from contextlib import AsyncExitStack
-import asyncio, json, os
+import asyncio, json, os, requests, re, urllib.parse
 
 load_dotenv()
 
+# ---------------------------
+# Ollama adapter (no OpenAI)
+# ---------------------------
+class OllamaAdapter:
+    def __init__(self, base: str = "http://127.0.0.1:11434"):
+        self.base = base.rstrip("/")
+
+    def chat_once(self, model: str, messages: List[Dict[str, str]], temperature: float = 0.1):
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "options": {"temperature": temperature},
+        }
+        r = requests.post(f"{self.base}/api/chat", json=payload, timeout=120)
+        r.raise_for_status()
+        data = r.json()
+        # Return an OpenAI-ish shape for minimal changes downstream
+        return {
+            "choices": [{
+                "message": {
+                    "role": data.get("message", {}).get("role", "assistant"),
+                    "content": data.get("message", {}).get("content", ""),
+                    "tool_calls": None,  # Ollama does not produce OpenAI-style tool_calls
+                }
+            }]
+        }
+
 
 def _flatten_tool_content(content_list) -> str:
-    """Flatten MCP CallToolResult.content into plain text for OpenAI 'tool' message."""
+    """Flatten MCP CallToolResult.content into plain text for display."""
     parts = []
     if isinstance(content_list, list):
         for item in content_list:
@@ -49,25 +76,18 @@ class ToolDefinition(TypedDict):
 
 class MCP_ChatBot:
     def __init__(self):
-        # Point to local proxy by default (LiteLLM on :4000); falls back to OpenAI if you set OPENAI_BASE_URL accordingly
-        base_url = os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:4000/v1")
-        api_key = os.getenv("OPENAI_API_KEY", "sk-local")  # any non-empty string for local proxies
+        # Point directly at Ollama by default; override via env if needed
+        #   LOCAL_BASE_URL=http://127.0.0.1:11434
+        #   LOCAL_MODEL=qwen2.5:1.5b
         self.model_default = os.getenv("LOCAL_MODEL", "qwen2.5:1.5b")
-
-        self.client = OpenAI(base_url=base_url, api_key=api_key)
-        
-        def print_available_models(client):
-            try:
-                resp = client.models.list()
-                print("Models from base_url:", [m.id for m in resp.data])
-            except Exception as e:
-                print("Failed to list models:", e)
+        self.client = OllamaAdapter(os.getenv("LOCAL_BASE_URL", "http://127.0.0.1:11434"))
 
         self.exit_stack = AsyncExitStack()
         self.sessions: List[ClientSession] = []
         self.tool_to_session: Dict[str, ClientSession] = {}
-        self.available_tools: List[ToolDefinition] = []  # OpenAI function-calling schema
+        self.available_tools: List[ToolDefinition] = []  # schemas we discovered
 
+    # ---- MCP tooling helpers ----
     def _openai_tools_from_mcp(self, mcp_tools: List[types.Tool]) -> List[dict]:
         tools = []
         for t in mcp_tools:
@@ -81,6 +101,81 @@ class MCP_ChatBot:
             })
         return tools
 
+    def _tools_summary_text(self) -> str:
+        if not self.available_tools:
+            return "No MCP tools are currently connected."
+        lines = []
+        for t in self.available_tools:
+            fn = t.get("function", {})
+            name = fn.get("name", "unknown")
+            desc = fn.get("description", "") or ""
+            params = fn.get("parameters", {}) or {}
+            lines.append(f"- {name}: {desc} | params: {json.dumps(params, ensure_ascii=False)}")
+        return "\n".join(lines)
+
+    def _system_preamble(self) -> str:
+        # Keep the model from hallucinating about what MCP is.
+        summary = self._tools_summary_text()
+        return (
+            "You are chatting in a local environment using a model served by Ollama. "
+            "MCP stands for Model Context Protocol. This runtime discovers MCP tools but "
+            "does not use OpenAI-style function calling automatically. "
+            "If the user asks about tools, show the list below.\n\n"
+            "Connected MCP tools:\n" + (summary if summary else "None")
+        )
+
+    # Convenience: call an MCP tool by name with JSON args
+    async def _call_mcp_tool(self, tool_name: str, args: dict) -> Optional[str]:
+        session = self.tool_to_session.get(tool_name)
+        if not session:
+            return None
+        try:
+            result = await session.call_tool(tool_name, arguments=args)
+            return _flatten_tool_content(result.content).strip()
+        except Exception as e:
+            return f"Tool '{tool_name}' failed: {e}"
+
+    # NEW: Let the model refine tool output into a nice human summary
+    async def _refine_with_model(
+        self,
+        tool_name: str,
+        tool_args: dict,
+        tool_output_text: str,
+        model: Optional[str] = None,
+    ) -> str:
+        """Pass tool output to the LLM for natural-language refinement."""
+        model = model or self.model_default
+
+        system = (
+            "You are a precise assistant. You will be given FRESH data from a tool. "
+            "Write a concise, helpful answer for a general audience. "
+            "Do NOT invent numbers or facts; only use the tool output. "
+            "Prefer Celsius if unit=celsius, Fahrenheit if unit=fahrenheit. "
+            "If appropriate, add one short tip (e.g., umbrella/sunglasses) based strictly on conditions."
+        )
+
+        user = (
+            f"Tool: {tool_name}\n"
+            f"Args: {json.dumps(tool_args, ensure_ascii=False)}\n"
+            "Raw tool output (JSON or text):\n"
+            "```\n"
+            f"{tool_output_text}\n"
+            "```\n\n"
+            "Task: Summarize the current weather succinctly (1–3 sentences). "
+            "Include temperature with unit and the main condition. "
+            "If the tool data lacks a value, omit it rather than guessing."
+        )
+
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+
+        resp = self.client.chat_once(model, messages, temperature=0.1)
+        msg = resp["choices"][0]["message"]
+        return (msg.get("content") or "").strip()
+
+    # ---- MCP discovery ----
     async def connect_to_server(self, server_name: str, server_cfg: dict):
         """Connect to one MCP server (stdio)."""
         try:
@@ -97,7 +192,7 @@ class MCP_ChatBot:
             tools = resp.tools or []
             print(f"Connected to {server_name} with tools:", [t.name for t in tools])
 
-            # Map tool -> session and add to OpenAI tool list
+            # Map tool -> session and add to tool list
             for t in tools:
                 self.tool_to_session[t.name] = session
             self.available_tools.extend(self._openai_tools_from_mcp(tools))
@@ -107,78 +202,163 @@ class MCP_ChatBot:
 
     async def connect_to_servers(self, config_path: str = "server_config.json"):
         """Read server_config.json and connect to each server."""
-        with open(config_path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        servers = cfg.get("mcpServers", {})
+        if not os.path.exists(config_path):
+            print(f"No {config_path} found — skipping MCP server connections.")
+            return
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception as e:
+            print(f"Failed to read {config_path}: {e}")
+            return
+
+        servers = (cfg or {}).get("mcpServers", {})
         for name, server_cfg in servers.items():
             await self.connect_to_server(name, server_cfg)
 
-    async def process_query(self, query: str, model: str | None = None):
+        # After connecting, show a neat summary
+        print("\n=== MCP tools summary ===")
+        print(self._tools_summary_text())
+        print("=========================\n")
+
+    # ---- Intent routing helpers ----
+    _url_re = re.compile(r"https?://\S+", re.I)
+
+    def _extract_url(self, text: str) -> Optional[str]:
+        m = self._url_re.search(text or "")
+        return m.group(0) if m else None
+
+    def _parse_weather(self, text: str) -> Optional[dict]:
+        """
+        Naive weather intent parser.
+        Returns dict like {"location": "Milan", "unit": "celsius"} or None if not detected.
+        """
+        if not text:
+            return None
+        lower = text.lower()
+        if "weather" not in lower:
+            return None
+
+        # try to extract location after "in ..."
+        loc = None
+        m = re.search(r"\b(?:in|at|for)\s+([a-zA-Z\u00C0-\u017F\s\-']+)", text)
+        if m:
+            loc = m.group(1).strip(" .,!?:;")
+
+        # Default to Celsius; switch if Fahrenheit mentioned
+        unit = "celsius"
+        if "fahrenheit" in lower or "°f" in lower:
+            unit = "fahrenheit"
+
+        # Also support prompts like "Milan celsius"
+        if not loc:
+            m2 = re.search(r"\b([A-Za-z\u00C0-\u017F][A-Za-z\u00C0-\u017F\s\-']+)\s+(celsius|fahrenheit)\b", lower)
+            if m2:
+                loc = m2.group(1).strip()
+                unit = m2.group(2)
+
+        if not loc:
+            # last resort
+            m3 = re.search(r"weather\s+(?:in|at|for)?\s*([A-Za-z\u00C0-\u017F][A-Za-z\u00C0-\u017F\s\-']*)", lower)
+            if m3:
+                loc = m3.group(1).strip()
+
+        if not loc:
+            return None
+        return {"location": loc, "unit": unit}
+
+    # ---- Chat / routing ----
+    def _looks_like_tools_query(self, text: str) -> bool:
+        if not text:
+            return False
+        return bool(re.search(r"\b(mcp\s+tools?|tools?|what.*tools|list.*tools)\b", text, re.I))
+
+    async def process_query(self, query: str, model: Optional[str] = None):
         model = model or self.model_default
-        messages: List[Dict[str, Any]] = [{"role": "user", "content": query}]
 
-        while True:
-            resp = self.client.chat.completions.create(
-                model=model,
-                messages=messages,
-                tools=self.available_tools or None,
-                tool_choice="auto" if self.available_tools else "none",
-                temperature=0.1,
-            )
-            msg = resp.choices[0].message
+        # 1) Deterministic tools listing
+        if self._looks_like_tools_query(query):
+            print("MCP tools available:")
+            print(self._tools_summary_text())
+            return
 
-            # Tool calls?
-            if msg.tool_calls:
-                # Keep assistant msg (with tool_calls) in history
-                messages.append({
-                    "role": "assistant",
-                    "content": msg.content or "",
-                    "tool_calls": [tc.model_dump() for tc in msg.tool_calls],
-                })
+        # 2) Direct URL → use fetch tool if available
+        url = self._extract_url(query)
+        if url and "fetch" in self.tool_to_session:
+            print(f"Fetching: {url}")
+            content = await self._call_mcp_tool("fetch", {
+                "url": url,
+                "max_length": 5000,
+                "raw": False
+            })
+            print(content or "(no content)")
+            return
 
-                for tc in msg.tool_calls:
-                    tool_name = tc.function.name
-                    raw_args = tc.function.arguments
-                    try:
-                        args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
-                    except Exception:
-                        args = {}
+        # 3) Weather intent → call weather tool if present; else fallback to fetch wttr.in
+        w = self._parse_weather(query)
+        if w:
+            if "get_current_weather" in self.tool_to_session:
+                args = {"location": w["location"], "unit": w["unit"]}
+                print(f"Calling MCP tool get_current_weather with {args}")
+                content = await self._call_mcp_tool("get_current_weather", args)
 
-                    session = self.tool_to_session.get(tool_name)
-                    if not session:
-                        # Unknown tool — tell the model
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "name": tool_name,
-                            "content": f"Tool '{tool_name}' is not available.",
-                        })
-                        continue
+                # Refine with the model for a human-friendly answer
+                refined = await self._refine_with_model(
+                    tool_name="get_current_weather",
+                    tool_args=args,
+                    tool_output_text=content or "",
+                    model=model,
+                )
+                print(refined or (content or "(no result)"))
+                return
 
-                    print(f"Calling tool {tool_name} with args {args}")
-                    try:
-                        result = await session.call_tool(tool_name, arguments=args)
-                        tool_content = _flatten_tool_content(result.content)
-                    except Exception as e:
-                        tool_content = f"Tool '{tool_name}' failed: {e}"
+            elif "fetch" in self.tool_to_session:
+                city = urllib.parse.quote(w["location"])
+                url = f"https://wttr.in/{city}?format=j1"
+                print(f"No get_current_weather tool. Falling back to fetch: {url}")
+                raw = await self._call_mcp_tool("fetch", {"url": url, "raw": True, "max_length": 10000})
 
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "name": tool_name,
-                        "content": tool_content,
-                    })
+                # Create a compact JSON we pass to the model
+                compact = None
+                try:
+                    data = json.loads(raw) if isinstance(raw, str) else raw
+                    cur = (data.get("current_condition") or [{}])[0]
+                    compact = {
+                        "location": w["location"],
+                        "unit": "celsius",
+                        "temperature": cur.get("temp_C"),
+                        "feels_like": cur.get("FeelsLikeC"),
+                        "desc": (cur.get("weatherDesc") or [{"value": ""}])[0].get("value", "")
+                    }
+                except Exception:
+                    pass
 
-                # Let the model read tool results and continue
-                continue
+                tool_text = json.dumps(compact, ensure_ascii=False) if compact else (raw or "")
+                refined = await self._refine_with_model(
+                    tool_name="fetch(wttr.in)",
+                    tool_args={"url": url},
+                    tool_output_text=tool_text,
+                    model=model,
+                )
+                print(refined or (tool_text or "(no result)"))
+                return
 
-            # Final answer (no tool calls)
-            if msg.content:
-                print(msg.content.strip())
-            break
+            else:
+                print("No weather-capable MCP tools connected (get_current_weather/fetch).")
+                return
+
+        # 4) Normal chat (with preamble so the model knows it's offline for tools)
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": self._system_preamble()},
+            {"role": "user", "content": query},
+        ]
+        resp = self.client.chat_once(model, messages, temperature=0.1)
+        msg = resp["choices"][0]["message"]
+        if msg.get("content"):
+            print(msg["content"].strip())
 
     async def chat_loop(self):
-        print("\nMCP Chatbot (OpenAI-compatible) — type your query, or 'quit' to exit.")
+        print("\nMCP Chatbot (Ollama) — type your query, or 'quit' to exit.")
         print(f"Using model: {self.model_default}")
         while True:
             try:
