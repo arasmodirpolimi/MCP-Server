@@ -76,7 +76,7 @@ class MCP_ChatBot:
         self.history = FileChatMessageHistory(history_path)
 
         # LLM used only for summarizing memory (cheap/small recommended)
-        summary_model = os.getenv("LC_SUMMARY_MODEL", "gpt-3.5-turbo")
+        summary_model = os.getenv("OPENAI_SUMMARY_MODEL", "gpt-3.5-turbo")
         self.summary_llm = ChatOpenAI(
             model=summary_model,
             temperature=0.0,
@@ -244,7 +244,7 @@ class MCP_ChatBot:
             break
 
     async def chat_loop(self):
-        print("\nMCP Chatbot (OpenAI + LangChain Memory) — type your query, 'forget' to clear memory, or 'quit' to exit.")
+        print(f"\nMCP Chatbot (OpenAI {os.getenv('OPENAI_SUMMARY_MODEL')} + LangChain Memory) — type your query, 'forget' to clear memory, or 'quit' to exit.")
         while True:
             try:
                 q = input("\nQuery: ").strip()

@@ -1,9 +1,15 @@
 from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
-from typing import List, Dict, TypedDict, Any, Optional
+from typing import List, Dict, TypedDict, Any, Optional, Union
 from contextlib import AsyncExitStack
 import asyncio, json, os, requests
+
+# ===== LangChain imports (local summarizer + persistent history) =====
+from langchain_ollama import ChatOllama
+from langchain.memory import ConversationSummaryBufferMemory   # <- use this
+from langchain_community.chat_message_histories import FileChatMessageHistory
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
 load_dotenv()
 
@@ -82,13 +88,41 @@ class ToolDefinition(TypedDict):
 
 class MCP_ChatBot:
     def __init__(self):
+        # ===== Models & endpoints =====
         self.model_default = os.getenv("LOCAL_MODEL", "qwen2.5:1.5b")
         self.client = OllamaAdapter(os.getenv("LOCAL_BASE_URL", "http://127.0.0.1:11434"))
+
+        # ===== MCP infra =====
         self.exit_stack = AsyncExitStack()
         self.sessions: List[ClientSession] = []
         self.tool_to_session: Dict[str, ClientSession] = {}
         self.available_tools: List[ToolDefinition] = []
 
+        # ===== LangChain Memory (NEW) =====
+        # 1) Persistent chat history file (override with LC_HISTORY_PATH)
+        history_path = os.getenv("LC_HISTORY_PATH", ".mcp_chat_history.json")
+        self.history = FileChatMessageHistory(history_path)
+
+        # 2) Local summarizer model via Ollama (override with LC_SUMMARY_MODEL)
+        #    Pick a small/fast model installed in Ollama (e.g., llama3.2:3b, qwen2.5:1.5b, phi4:latest).
+        summary_model = os.getenv("LC_SUMMARY_MODEL", "qwen2.5:1.5b")
+        self.summary_llm = ChatOllama(
+            model=summary_model,
+            base_url=os.getenv("LOCAL_BASE_URL", "http://127.0.0.1:11434"),
+            temperature=0.0
+        )
+
+        # 3) Summary buffer to keep memory compact
+        self.memory = ConversationSummaryBufferMemory(
+            llm=self.summary_llm,
+            chat_memory=self.history,          
+            return_messages=True,
+            input_key="input",
+            output_key="output",
+            max_token_limit=int(os.getenv("LC_MAX_TOKENS", "3000")),
+        )
+
+    # ---------------------- MCP wiring ----------------------
     def _openai_tools_from_mcp(self, mcp_tools: List[types.Tool]) -> List[dict]:
         out = []
         for t in mcp_tools:
@@ -147,9 +181,40 @@ class MCP_ChatBot:
         for name, server_cfg in (cfg.get("mcpServers", {}) or {}).items():
             await self.connect_to_server(name, server_cfg)
 
+    # ---------------------- Memory helpers (NEW) ----------------------
+    def _lc_history_to_openai_messages(self, history: Union[str, List[Any]]) -> List[Dict[str, str]]:
+        """Convert LangChain memory history into Ollama/OpenAI-style messages."""
+        msgs: List[Dict[str, str]] = []
+        # If ConversationSummaryBufferMemory returns a summary string
+        if isinstance(history, str):
+            if history.strip():
+                msgs.append({"role": "system", "content": f"Conversation summary so far:\n{history}"})
+            return msgs
+
+        # Otherwise it's a list[BaseMessage]
+        for m in history:
+            if isinstance(m, HumanMessage):
+                msgs.append({"role": "user", "content": m.content})
+            elif isinstance(m, AIMessage):
+                msgs.append({"role": "assistant", "content": m.content})
+            elif isinstance(m, SystemMessage):
+                msgs.append({"role": "system", "content": m.content})
+            # Skip tool messages here; tool outputs are re-fed within the same turn
+        return msgs
+
+    def clear_memory(self):
+        self.history.clear()
+        print("✅ Memory cleared.")
+
+    # ---------------------- Chat loop with memory ----------------------
     async def process_query(self, query: str, model: Optional[str] = None):
         model = model or self.model_default
 
+        # 1) Pull prior memory and convert to messages
+        prior = self.memory.load_memory_variables({}).get("history", [])
+        memory_msgs = self._lc_history_to_openai_messages(prior)
+
+        # 2) Optional system preamble advertising tools
         system_preamble = None
         if self.available_tools:
             tool_names = [t['function']['name'] for t in self.available_tools]
@@ -158,12 +223,15 @@ class MCP_ChatBot:
                 'content': 'You can call functions to satisfy user requests. Available tools: ' + ', '.join(tool_names)
             }
 
+        # 3) Build the conversation to send to the model
         messages: List[Dict[str, Any]] = []
+        messages.extend(memory_msgs)
         if system_preamble:
             messages.append(system_preamble)
         messages.append({'role': 'user', 'content': query})
 
-        # Run a full tool loop until the model stops calling tools
+        # 4) Full tool loop until model stops calling tools
+        final_text: str = ""
         while True:
             resp = self.client.chat_once(
                 model=model,
@@ -175,9 +243,8 @@ class MCP_ChatBot:
             msg = resp['choices'][0]['message']
             tool_calls = msg.get('tool_calls') or []
 
-            # If the model wants to call tools, do them and continue
             if tool_calls:
-                # Keep the assistant step (with tool_calls) in the transcript
+                # Keep the assistant step (with tool_calls) in the transcript for the model
                 messages.append({
                     'role': msg.get('role', 'assistant'),
                     'content': msg.get('content', '') or "",
@@ -204,17 +271,23 @@ class MCP_ChatBot:
                         'name': name,
                         'content': result_text,
                     })
-
-                # Let the model see tool outputs and possibly call more tools
+                # loop to let the model see tool outputs
                 continue
 
             # No more tool calls — print final content if present and exit
-            if msg.get('content'):
-                print(msg['content'].strip())
+            final_text = (msg.get('content') or "").strip()
+            if final_text:
+                print(final_text)
             break
 
+        # 5) Save this turn into memory (triggers summarization as needed)
+        try:
+            self.memory.save_context({"input": query}, {"output": final_text or "[no text]"})
+        except Exception as mem_err:
+            print(f"(Memory error — continuing without memory this turn): {mem_err}")
+
     async def chat_loop(self):
-        print("\nLocal MCP Chatbot (Ollama) — type your query, or 'quit' to exit.")
+        print(f"\nLocal MCP Chatbot (Ollama {self.model_default} + LangChain Memory) — type your query, 'forget' to clear memory, or 'quit' to exit.")
         while True:
             try:
                 q = input("\nQuery: ").strip()
@@ -222,6 +295,9 @@ class MCP_ChatBot:
                     continue
                 if q.lower() in ("quit", "exit"):
                     break
+                if q.lower() == "forget":
+                    self.clear_memory()
+                    continue
                 await self.process_query(q)
             except (EOFError, KeyboardInterrupt):
                 break
