@@ -10,7 +10,7 @@
             ]
         },
         
-        "research": {
+        "weather": {
             "command": "uv",
             "args": ["run", "weather_server.py"]
         },
